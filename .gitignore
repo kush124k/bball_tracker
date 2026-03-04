@@ -1,0 +1,15 @@
+# Ignore the environment
+venv/
+Include/
+Lib/
+Scripts/
+pyvenv.cfg
+
+# Ignore models and data
+*.pt
+*.weights
+data/
+models/
+
+# Ignore cache
+__pycache__/

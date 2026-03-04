@@ -1,0 +1,11 @@
+# Vision & Deep Learning
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+
+# Tracking & Analytics
+supervision>=0.18.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Data Export
+pandas>=2.0.0
