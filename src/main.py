@@ -1,102 +1,81 @@
 import cv2
-import numpy as np
-import supervision as sv
+import yaml
 import os
 from pathlib import Path
+import supervision as sv
 
 from features.detector import VisionDetector
 from features.tracker import ObjectTracker
 from analytics.possession import PossessionEngine
-from core.state_manager import StateManager  # <-- Added the import
+from analytics.actions import ActionClassifier
+from core.state_manager import StateManager
 
-def run_test_pipeline(input_video_path: str, output_video_path: str):
-    print(f"Loading models and processing {input_video_path}...")
+def load_config(config_path):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def select_video(raw_dir):
+    videos = [f for f in os.listdir(raw_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
+    if not videos:
+        print(f"❌ No videos found in {raw_dir}")
+        return None
     
-    # 1. Initialize our modules
-    detector = VisionDetector(model_path="yolov8m.pt") 
+    print("\n--- Available Videos ---")
+    for i, v in enumerate(videos):
+        print(f"[{i}] {v}")
+    
+    choice = int(input("\nSelect video index to process: "))
+    return videos[choice]
+
+def run_bball_pipeline():
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    
+    # 1. Dynamic Selection
+    video_name = select_video(PROJECT_ROOT / "data" / "raw")
+    if not video_name: return
+
+    input_path = str(PROJECT_ROOT / "data" / "raw" / video_name)
+    output_path = str(PROJECT_ROOT / "data" / "processed" / f"processed_{video_name}")
+
+    # 2. Initialize with YAML settings
+    detector = VisionDetector(model_name=config['model']['name']) 
     tracker = ObjectTracker()
-    possession_engine = PossessionEngine(possession_threshold=150) 
+    state_manager = StateManager()
+    possession_engine = PossessionEngine(possession_threshold=config['possession']['threshold'])
+    action_classifier = ActionClassifier(window_size=config['actions']['window_size'])
     
-    # Initialize the memory module outside the loop so it persists!
-    state_manager = StateManager() 
-    
-    # Annotators for drawing
     box_annotator = sv.BoxAnnotator()
     label_annotator = sv.LabelAnnotator()
 
-    # 2. Define what happens to each individual frame
-    def process_frame(frame: np.ndarray, _: int) -> np.ndarray:
-        # Detect everything
+    def process_frame(frame, _):
         detections = detector.detect(frame)
-        
-        # Separate the ball (Class 32)
-        ball_mask = detections.class_id == 32
-        ball_detections = detections[ball_mask]
-        
-        # Separate the players (Class 0) and track them
-        player_mask = detections.class_id == 0
-        player_detections = detections[player_mask]
+        ball_detections = detections[detections.class_id == 32]
+        player_detections = detections[detections.class_id == 0]
         tracked_players = tracker.update(player_detections)
         
-        # --- THE MATH & MEMORY LAYER (Must happen before drawing) ---
-        # 1. Get raw visual distance
-        raw_possessor_id = possession_engine.get_possessor(players=tracked_players, ball=ball_detections)
-        
-        # 2. Filter it through the Rule Book memory
+        raw_possessor_id = possession_engine.get_possessor(tracked_players, ball_detections)
         true_possessor_id = state_manager.update_possession(raw_possessor_id)
-        # -------------------------------------------------------------
-        
-        # --- THE DRAWING LAYER ---
-        # Create labels for players using the TRUE possessor
-        labels = []
-        for class_id, tracker_id, confidence in zip(
-            tracked_players.class_id, 
-            tracked_players.tracker_id, 
-            tracked_players.confidence
-        ):
-            if tracker_id == true_possessor_id:
-                labels.append(f"⭐ #{tracker_id} HAS BALL")
-            else:
-                labels.append(f"#{tracker_id} {detector.model.names[class_id]}")
-        
-        # Draw player boxes and labels
-        annotated_frame = frame.copy()
-        annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=tracked_players)
+        current_action = action_classifier.classify(ball_detections, true_possessor_id)
+
+        # Adaptive UI
+        h, w, _ = frame.shape
+        font_scale = w / config['ui']['font_scale_base']
+        thickness = max(1, int(w / 400))
+
+        labels = [f"#{tid} {'BALL' if tid == true_possessor_id else 'Player'}" 
+                  for tid in tracked_players.tracker_id]
+
+        annotated_frame = box_annotator.annotate(scene=frame.copy(), detections=tracked_players)
         annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=tracked_players, labels=labels)
         
-        # Draw a simple box around the ball
-        annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=ball_detections)
-        
-        # Draw the big HUD overlay text using the TRUE possessor
-        hud_text = f"Possession: Player {true_possessor_id}" if true_possessor_id else "Possession: Loose Ball"
-        text_color = (0, 255, 0) if true_possessor_id else (0, 0, 255) 
-        
-        cv2.putText(
-            annotated_frame, 
-            hud_text, 
-            (40, 60), 
-            cv2.FONT_HERSHEY_SIMPLEX, 
-            1.5,      
-            text_color, 
-            4         
-        )
+        cv2.putText(annotated_frame, f"Possession: {true_possessor_id} | {current_action}", 
+                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX, font_scale, config['ui']['hud_color'], thickness)
         
         return annotated_frame
 
-    # 3. Run the video processor
-    sv.process_video(
-        source_path=input_video_path,
-        target_path=output_video_path,
-        callback=process_frame
-    )
-    print(f" Done! Annotated video saved to {output_video_path}")
+    print(f"🚀 Processing: {video_name} -> processed_{video_name}")
+    sv.process_video(source_path=input_path, target_path=output_path, callback=process_frame)
 
 if __name__ == "__main__":
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
-    input_video = str(PROJECT_ROOT / "data" / "raw" / "sample.mp4")
-    output_video = str(PROJECT_ROOT / "data" / "processed" / "output.mp4")
-    
-    if not os.path.exists(input_video):
-        print(f" Error: Could not find {input_video}")
-    else:
-        run_test_pipeline(input_video, output_video)
+    run_bball_pipeline()
