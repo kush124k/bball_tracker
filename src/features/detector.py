@@ -2,25 +2,31 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import supervision as sv
+from pathlib import Path  # Added missing import
 
 class VisionDetector:
-    def __init__(self, model_path: str = "yolov8m.pt"):
+    def __init__(self, model_name: str = "yolov8m.pt"):
         """
-        Initializes the YOLO model and the annotators.
-        Using yolov8n.pt (nano) by default for fast testing.
+        Initializes the YOLO model and annotators using a model name
+        from the config.yaml.
         """
-        
+        # Dynamically locate the project root
         project_root = Path(__file__).resolve().parent.parent.parent
+        
+        # Priority 1: Check the /models/ folder
         model_path = project_root / "models" / model_name
-        # Load the YOLO model (it will auto-download the weights the first time)
+        
+        # Priority 2: Fallback to root (where they were originally)
+        if not model_path.exists():
+            model_path = project_root / model_name
+            
+        # Load the YOLO model
         self.model = YOLO(str(model_path))
         
-        # In the standard COCO dataset:
-        # 0 = 'person'
-        # 32 = 'sports ball'
+        # 0 = 'person', 32 = 'sports ball'
         self.target_classes = [0, 32]
         
-        # Supervision tools for easy debugging overlays
+        # Supervision tools initialized once to prevent memory leaks
         self.box_annotator = sv.BoxAnnotator()
         self.label_annotator = sv.LabelAnnotator()
 
@@ -28,29 +34,22 @@ class VisionDetector:
         """
         Runs inference on a single frame and returns filtered detections.
         """
-        # 1. Run YOLO inference (verbose=False keeps your terminal clean)
         results = self.model(frame, verbose=False)[0]
-        
-        # 2. Convert raw YOLO output into a Supervision Detections object
         detections = sv.Detections.from_ultralytics(results)
         
-        # 3. Filter out the noise (we only want players and the ball)
+        # Filter for only players and the ball
         mask = np.isin(detections.class_id, self.target_classes)
-        filtered_detections = detections[mask]
-        
-        return filtered_detections
+        return detections[mask]
 
     def draw_debug(self, frame: np.ndarray, detections: sv.Detections) -> np.ndarray:
         """
-        Draws bounding boxes and labels on the frame for visual confirmation.
+        Standard drawing method for basic visual confirmation.
         """
-        # Extract the class names ('person', 'sports ball') for the labels
         labels = [
             f"{self.model.names[class_id]} {confidence:.2f}"
             for class_id, confidence in zip(detections.class_id, detections.confidence)
         ]
         
-        # Draw the boxes and labels onto a copy of the frame
         annotated_frame = frame.copy()
         annotated_frame = self.box_annotator.annotate(scene=annotated_frame, detections=detections)
         annotated_frame = self.label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)

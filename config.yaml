@@ -1,0 +1,16 @@
+# Model Settings
+model:
+  name: "yolov8m.pt"
+  target_classes: [0, 32]  # 0: person, 32: sports ball
+
+# Analytics Settings
+possession:
+  threshold: 160          # Distance in pixels
+actions:
+  window_size: 10         # Frames for dribble detection
+  dribble_variance: 25    # Threshold for vertical oscillation
+
+# UI Settings
+ui:
+  hud_color: [0, 255, 0]  # Green in BGR
+  font_scale_base: 1200   # Used for adaptive scaling
