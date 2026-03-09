@@ -1,57 +1,72 @@
-import cv2
 import numpy as np
+from pathlib import Path
 from ultralytics import YOLO
 import supervision as sv
-from pathlib import Path  # Added missing import
+
 
 class VisionDetector:
-    def __init__(self, model_name: str = "yolov8m.pt"):
+    def __init__(self, profile: dict):
         """
-        Initializes the YOLO model and annotators using a model name
-        from the config.yaml.
+        Accepts an angle-specific profile dict loaded from angle_profiles.yaml.
+        Example profile:
+            model_name: "yolov8n.pt"
+            inference_size: 640
+            person_confidence: 0.40
+            ball_confidence: 0.15
         """
-        # Dynamically locate the project root
+        model_name = profile['model_name']
+        self.inference_size = profile.get('inference_size', 640)
+        self.person_confidence = profile.get('person_confidence', 0.40)
+        self.ball_confidence = profile.get('ball_confidence', 0.20)
+
         project_root = Path(__file__).resolve().parent.parent.parent
-        
-        # Priority 1: Check the /models/ folder
         model_path = project_root / "models" / model_name
-        
-        # Priority 2: Fallback to root (where they were originally)
-        if not model_path.exists():
-            model_path = project_root / model_name
-            
-        # Load the YOLO model
         self.model = YOLO(str(model_path))
-        
-        # 0 = 'person', 32 = 'sports ball'
-        self.target_classes = [0, 32]
-        
-        # Supervision tools initialized once to prevent memory leaks
+
+        # 0 = person, 32 = sports ball
+        self.person_class = 0
+        self.ball_class = 32
+
         self.box_annotator = sv.BoxAnnotator()
         self.label_annotator = sv.LabelAnnotator()
 
     def detect(self, frame: np.ndarray) -> sv.Detections:
         """
-        Runs inference on a single frame and returns filtered detections.
+        Runs inference and returns detections with per-class confidence filtering.
+        Ball uses a lower threshold than persons since it's harder to detect.
         """
-        results = self.model(frame, verbose=False)[0]
+        results = self.model(
+            frame,
+            verbose=False,
+            imgsz=self.inference_size,
+            # Use the lower of the two thresholds so both classes pass through
+            # We then filter per-class below
+            conf=min(self.person_confidence, self.ball_confidence)
+        )[0]
+
         detections = sv.Detections.from_ultralytics(results)
-        
-        # Filter for only players and the ball
-        mask = np.isin(detections.class_id, self.target_classes)
-        return detections[mask]
+
+        # Only keep the classes we care about
+        class_mask = np.isin(detections.class_id, [self.person_class, self.ball_class])
+        detections = detections[class_mask]
+
+        if len(detections) == 0:
+            return detections
+
+        # Apply per-class confidence thresholds
+        person_mask = (detections.class_id == self.person_class) & \
+                      (detections.confidence >= self.person_confidence)
+        ball_mask = (detections.class_id == self.ball_class) & \
+                    (detections.confidence >= self.ball_confidence)
+
+        return detections[person_mask | ball_mask]
 
     def draw_debug(self, frame: np.ndarray, detections: sv.Detections) -> np.ndarray:
-        """
-        Standard drawing method for basic visual confirmation.
-        """
         labels = [
             f"{self.model.names[class_id]} {confidence:.2f}"
             for class_id, confidence in zip(detections.class_id, detections.confidence)
         ]
-        
-        annotated_frame = frame.copy()
-        annotated_frame = self.box_annotator.annotate(scene=annotated_frame, detections=detections)
-        annotated_frame = self.label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
-        
-        return annotated_frame
+        annotated = frame.copy()
+        annotated = self.box_annotator.annotate(scene=annotated, detections=detections)
+        annotated = self.label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
+        return annotated
