@@ -3,8 +3,9 @@ from collections import deque
 
 
 class ActionClassifier:
-    def __init__(self, window_size=10):
+    def __init__(self, window_size=10, dribble_variance=25):
         self.window_size = window_size
+        self.dribble_variance = dribble_variance
         self.y_history = deque(maxlen=window_size)
         self.last_possessor = None
         self.prev_possessor = None  # Used to detect pass/shot transitions
@@ -56,7 +57,7 @@ class ActionClassifier:
 
         # Low variance = holding, high variance = dribbling
         y_variance = np.std(self.y_history)
-        if y_variance > 25:
+        if y_variance > self.dribble_variance:
             return "dribbling"
 
         return "holding"

@@ -1,16 +1,23 @@
 # Model Settings
 model:
-  name: "yolov8m.pt"
+  name: "yolov8n.pt"       # Switch to nano for speed — m is overkill for possession tracking
   target_classes: [0, 32]  # 0: person, 32: sports ball
+  inference_size: 640       # Input resolution — drop to 416 if still slow
+  confidence: 0.35          # Filter weak detections early, less for tracker to process
 
 # Analytics Settings
 possession:
-  threshold: 160          # Distance in pixels
+  threshold: 160            # Distance in pixels
 actions:
-  window_size: 10         # Frames for dribble detection
-  dribble_variance: 25    # Threshold for vertical oscillation
+  window_size: 10           # Frames for dribble detection
+  dribble_variance: 25      # Pulled from here now — was hardcoded at 25 in actions.py
+
+# Processing Settings
+processing:
+  frame_stride: 2           # Only process every Nth frame (1 = every frame, 2 = half, etc.)
+  resize_width: 1280        # Downscale input before inference if source is 4K
 
 # UI Settings
 ui:
-  hud_color: [0, 255, 0]  # Green in BGR
-  font_scale_base: 1200   # Used for adaptive scaling
+  hud_color: [0, 255, 0]   # Green in BGR
+  font_scale_base: 1200     # Used for adaptive scaling

@@ -1,0 +1,63 @@
+# angle_profiles.yaml
+# Per-angle settings for detection, tracking, and possession.
+# main.py reads this after view classification and passes the
+# matching profile to each module.
+
+sideline:
+  detector:
+    model_name: "yolov8n.pt"
+    inference_size: 640
+    # Lower confidence for ball — it moves fast and blurs at sideline angle
+    person_confidence: 0.40
+    ball_confidence: 0.15
+  tracker:
+    track_activation_threshold: 0.25
+    # Longer buffer — sideline has frequent occlusion when players cross
+    lost_track_buffer: 90
+    # Looser matching — strict re-ID causes swapping at this angle
+    minimum_matching_threshold: 0.70
+    minimum_consecutive_frames: 3
+    frame_rate: 30
+  possession:
+    # Larger threshold — depth distortion makes pixel distances less reliable
+    threshold: 180
+  actions:
+    window_size: 12
+    dribble_variance: 20
+
+broadcast:
+  detector:
+    model_name: "yolov8n.pt"
+    inference_size: 1280
+    person_confidence: 0.45
+    ball_confidence: 0.25
+  tracker:
+    track_activation_threshold: 0.25
+    lost_track_buffer: 60
+    minimum_matching_threshold: 0.80
+    minimum_consecutive_frames: 2
+    frame_rate: 30
+  possession:
+    threshold: 120
+  actions:
+    window_size: 10
+    dribble_variance: 25
+
+overhead:
+  detector:
+    model_name: "yolov8n.pt"
+    inference_size: 640
+    person_confidence: 0.45
+    ball_confidence: 0.30
+  tracker:
+    track_activation_threshold: 0.30
+    lost_track_buffer: 45
+    minimum_matching_threshold: 0.85
+    minimum_consecutive_frames: 2
+    frame_rate: 30
+  possession:
+    # Tighter threshold — overhead gives accurate real-world distances
+    threshold: 80
+  actions:
+    window_size: 10
+    dribble_variance: 15
