@@ -1,23 +1,45 @@
 # Model Settings
 model:
-  name: "yolov8n.pt"       # Switch to nano for speed — m is overkill for possession tracking
+  name: "yolov8n.pt"       # Switch to yolov8s.pt or yolov8m.pt for accuracy
   target_classes: [0, 32]  # 0: person, 32: sports ball
-  inference_size: 640       # Input resolution — drop to 416 if still slow
-  confidence: 0.35          # Filter weak detections early, less for tracker to process
+  inference_size: 640      # Input resolution
+  confidence: 0.35         # Global fallback confidence
+  pose_model: null         # Set to "yolov8n-pose.pt" to enable hand tracking
 
-# Analytics Settings
+# Possession Settings
 possession:
-  threshold: 160            # Distance in pixels
+  threshold: 160            # Max pixel distance for "in possession"
+  smoothing_frames: 5       # Consecutive frames before possession switches
+
+# Action Detection
 actions:
-  window_size: 10           # Frames for dribble detection
-  dribble_variance: 25      # Pulled from here now — was hardcoded at 25 in actions.py
+  window_size: 10           # Frames for dribble/action analysis
+  dribble_variance: 25      # Y-oscillation threshold for dribble detection
 
 # Processing Settings
 processing:
-  frame_stride: 2           # Only process every Nth frame (1 = every frame, 2 = half, etc.)
-  resize_width: 1280        # Downscale input before inference if source is 4K
+  frame_stride: 1           # Process every Nth frame (1 = all, 2 = half speed)
+  resize_width: 1280        # Downscale before inference if source is wider
 
 # UI Settings
 ui:
-  hud_color: [0, 255, 0]   # Green in BGR
-  font_scale_base: 1200     # Used for adaptive scaling
+  hud_color: [0, 255, 0]   # HUD accent colour (BGR)
+  font_scale_base: 1200     # Adaptive font scaling base
+  show_trails: true         # Draw player trajectory trails
+  trail_length: 30          # Frames of trail history to show
+  show_minimap: true        # Court minimap overlay
+  show_team_colors: true    # Colour bounding boxes by team
+  team_a_color: [255, 140, 50]   # BGR — warm blue
+  team_b_color: [50, 50, 255]    # BGR — red
+
+# Export Settings
+export:
+  csv: true
+  json: true
+  timeline_chart: true
+  output_dir: "data/exports"
+
+# Logging
+log:
+  level: "INFO"             # DEBUG | INFO | WARNING | ERROR
+  file: null                # Set to "logs/session.log" for file logging

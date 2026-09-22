@@ -1,72 +1,136 @@
+"""
+YOLO-based object detector with frame-stride caching and auto-resize.
+
+Changes from original:
+- Accepts typed profile from config (not raw dict)
+- Frame stride: skip N frames, return cached detections
+- Auto-resize: downscale 4K frames before inference
+- Model auto-download: if file not in models/, ultralytics fetches it
+- Implements Processor interface for pipeline integration
+"""
+
 import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
 import supervision as sv
 
+from core.frame_state import FrameState, Processor
+from utils.logger import get_logger
 
-class VisionDetector:
-    def __init__(self, profile: dict):
-        """
-        Accepts an angle-specific profile dict loaded from angle_profiles.yaml.
-        Example profile:
-            model_name: "yolov8n.pt"
-            inference_size: 640
-            person_confidence: 0.40
-            ball_confidence: 0.15
-        """
-        model_name = profile['model_name']
-        self.inference_size = profile.get('inference_size', 640)
-        self.person_confidence = profile.get('person_confidence', 0.40)
-        self.ball_confidence = profile.get('ball_confidence', 0.20)
+log = get_logger(__name__)
 
+
+class VisionDetector(Processor):
+    """
+    Runs YOLO inference and splits results into player / ball detections.
+
+    Writes to ``state.all_detections``, ``state.player_detections``,
+    ``state.ball_detections``.
+    """
+
+    PERSON_CLASS = 0
+    BALL_CLASS = 32
+
+    def __init__(
+        self,
+        profile: dict | None = None,
+        frame_stride: int = 1,
+        resize_width: int | None = None,
+    ):
+        p = profile or {}
+        model_name = p.get("model_name", "yolov8n.pt")
+        self._inference_size = p.get("inference_size", 640)
+        self._person_conf = p.get("person_confidence", 0.40)
+        self._ball_conf = p.get("ball_confidence", 0.20)
+        self._frame_stride = max(1, frame_stride)
+        self._resize_width = resize_width
+
+        # Resolve model path — try local models/ dir first, fall back to
+        # ultralytics auto-download
         project_root = Path(__file__).resolve().parent.parent.parent
-        model_path = project_root / "models" / model_name
-        self.model = YOLO(str(model_path))
+        local_path = project_root / "models" / model_name
+        if local_path.exists():
+            self._model = YOLO(str(local_path))
+            log.info("Loaded model from %s", local_path)
+        else:
+            log.info("Model not found locally, downloading %s via ultralytics", model_name)
+            self._model = YOLO(model_name)
 
-        # 0 = person, 32 = sports ball
-        self.person_class = 0
-        self.ball_class = 32
+        # Cache for frame-stride skipping
+        self._cache: sv.Detections | None = None
+        self._cache_players: sv.Detections | None = None
+        self._cache_ball: sv.Detections | None = None
 
-        self.box_annotator = sv.BoxAnnotator()
-        self.label_annotator = sv.LabelAnnotator()
+    # ─── Processor interface ───────────────────────────────────────────
 
-    def detect(self, frame: np.ndarray) -> sv.Detections:
-        """
-        Runs inference and returns detections with per-class confidence filtering.
-        Ball uses a lower threshold than persons since it's harder to detect.
-        """
-        results = self.model(
+    def process(self, state: FrameState) -> FrameState:
+        frame = state.raw_frame
+        if frame is None:
+            return state
+
+        # Frame stride — return cached results for skipped frames
+        if self._frame_stride > 1 and state.frame_index % self._frame_stride != 0:
+            if self._cache is not None:
+                state.all_detections = self._cache
+                state.player_detections = self._cache_players
+                state.ball_detections = self._cache_ball
+                return state
+
+        # Optionally resize
+        inference_frame = frame
+        if self._resize_width and frame.shape[1] > self._resize_width:
+            scale = self._resize_width / frame.shape[1]
+            import cv2
+            inference_frame = cv2.resize(
+                frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR
+            )
+
+        detections = self._detect(inference_frame)
+
+        # If we resized, scale boxes back to original resolution
+        if inference_frame is not frame:
+            inv_scale = frame.shape[1] / inference_frame.shape[1]
+            detections.xyxy = (detections.xyxy * inv_scale).astype(np.float32)
+
+        # Split by class
+        players = self._filter_class(detections, self.PERSON_CLASS, self._person_conf)
+        ball = self._filter_class(detections, self.BALL_CLASS, self._ball_conf)
+
+        # Cache
+        self._cache = detections
+        self._cache_players = players
+        self._cache_ball = ball
+
+        state.all_detections = detections
+        state.player_detections = players
+        state.ball_detections = ball
+        return state
+
+    # ─── Internals ─────────────────────────────────────────────────────
+
+    def _detect(self, frame: np.ndarray) -> sv.Detections:
+        """Run inference and return detections for person + ball classes."""
+        results = self._model(
             frame,
             verbose=False,
-            imgsz=self.inference_size,
-            # Use the lower of the two thresholds so both classes pass through
-            # We then filter per-class below
-            conf=min(self.person_confidence, self.ball_confidence)
+            imgsz=self._inference_size,
+            conf=min(self._person_conf, self._ball_conf),
         )[0]
 
-        detections = sv.Detections.from_ultralytics(results)
+        dets = sv.Detections.from_ultralytics(results)
 
-        # Only keep the classes we care about
-        class_mask = np.isin(detections.class_id, [self.person_class, self.ball_class])
-        detections = detections[class_mask]
+        # Keep only person and ball
+        mask = np.isin(dets.class_id, [self.PERSON_CLASS, self.BALL_CLASS])
+        return dets[mask]
 
-        if len(detections) == 0:
-            return detections
+    @staticmethod
+    def _filter_class(
+        dets: sv.Detections, class_id: int, min_conf: float
+    ) -> sv.Detections:
+        """Filter detections to a single class with a confidence threshold."""
+        if len(dets) == 0:
+            return sv.Detections.empty()
 
-        # Apply per-class confidence thresholds
-        person_mask = (detections.class_id == self.person_class) & \
-                      (detections.confidence >= self.person_confidence)
-        ball_mask = (detections.class_id == self.ball_class) & \
-                    (detections.confidence >= self.ball_confidence)
-
-        return detections[person_mask | ball_mask]
-
-    def draw_debug(self, frame: np.ndarray, detections: sv.Detections) -> np.ndarray:
-        labels = [
-            f"{self.model.names[class_id]} {confidence:.2f}"
-            for class_id, confidence in zip(detections.class_id, detections.confidence)
-        ]
-        annotated = frame.copy()
-        annotated = self.box_annotator.annotate(scene=annotated, detections=detections)
-        annotated = self.label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
-        return annotated
+        mask = (dets.class_id == class_id) & (dets.confidence >= min_conf)
+        filtered = dets[mask]
+        return filtered if len(filtered) > 0 else sv.Detections.empty()

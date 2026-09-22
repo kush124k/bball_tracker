@@ -1,189 +1,176 @@
+"""
+Jersey-colour classifier using scipy KMeans.
+
+Changes from original:
+- Replaced sklearn with scipy.cluster.vq (eliminates heavy dependency)
+- Cached team assignments — only reclassify when necessary
+- Uses shared crop_region() from geometry utils
+- Implements Processor interface
+"""
+
 import cv2
 import numpy as np
-from sklearn.cluster import KMeans
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 import supervision as sv
+from scipy.cluster.vq import kmeans2
+
+from core.frame_state import FrameState, Processor
+from utils.geometry import crop_region
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
-@dataclass
-class JerseyProfile:
-    team_a_color: np.ndarray     # Mean HSV color of team A
-    team_b_color: np.ndarray     # Mean HSV color of team B
-    team_a_ids: list             # Tracker IDs assigned to team A
-    team_b_ids: list             # Tracker IDs assigned to team B
-    outlier_ids: list            # IDs that don't match either team (refs, coaches)
-
-
-class JerseyClassifier:
+class JerseyClassifier(Processor):
     """
-    Separates players into two teams and identifies non-players (refs,
-    coaches) using KMeans clustering on jersey colors.
-
-    Runs on the upper-body crop of each detection bbox to avoid picking
-    up court color from legs/shoes.
-
-    Usage:
-        - Call build_profile() on the first N frames to establish team colors
-        - Call classify(detections) per-frame to assign team labels
-        - Call filter_non_players(detections) to remove refs/coaches
+    Separates players into two teams and identifies non-players
+    (refs, coaches) using KMeans clustering on jersey HSV colours.
     """
 
-    # How far a detection's color can be from a team cluster before
-    # being flagged as an outlier (ref, coach, etc.)
-    # In HSV Euclidean distance — tune if refs share team colors
-    OUTLIER_DISTANCE_THRESHOLD = 40.0
-
-    # Fraction of bbox height to use for jersey crop (top portion)
+    OUTLIER_DISTANCE = 40.0
     JERSEY_CROP_TOP = 0.15
     JERSEY_CROP_BOTTOM = 0.55
+    MIN_PLAYERS_FOR_CALIBRATION = 4
+    RECLASSIFY_INTERVAL = 60       # Re-check assignments every N frames
 
     def __init__(self):
-        self.team_a_color: Optional[np.ndarray] = None
-        self.team_b_color: Optional[np.ndarray] = None
+        self._team_a_color: Optional[np.ndarray] = None
+        self._team_b_color: Optional[np.ndarray] = None
         self._is_calibrated = False
-        self._id_to_team: dict = {}
+        self._last_calibration_frame = -999
+        self._cached_assignments: Dict[int, str] = {}
 
     @property
     def is_calibrated(self) -> bool:
         return self._is_calibrated
 
+    # ─── Processor interface ───────────────────────────────────────────
+
+    def process(self, state: FrameState) -> FrameState:
+        frame = state.raw_frame
+        players = state.player_detections
+
+        if frame is None or players is None or len(players) == 0:
+            return state
+
+        # Attempt calibration periodically until it succeeds
+        if not self._is_calibrated:
+            if (state.frame_index - self._last_calibration_frame) >= 15:
+                self._last_calibration_frame = state.frame_index
+                success = self.build_profile(frame, players)
+                if success:
+                    log.info("[Frame %d] Jersey calibration succeeded", state.frame_index)
+                else:
+                    log.debug(
+                        "[Frame %d] Jersey calibration needs more players (%d visible)",
+                        state.frame_index, len(players),
+                    )
+
+        # Filter non-players + assign teams
+        if self._is_calibrated:
+            state.player_detections = self.filter_non_players(frame, players)
+            if state.tracked_players is not None and state.tracked_players.tracker_id is not None:
+                assignments = self.classify(frame, state.tracked_players)
+                # Merge into state — map index → tracker_id
+                for idx, label in assignments.items():
+                    if idx < len(state.tracked_players.tracker_id):
+                        tid = state.tracked_players.tracker_id[idx]
+                        state.team_assignments[tid] = label
+
+        return state
+
+    # ─── Calibration ───────────────────────────────────────────────────
+
     def build_profile(self, frame: np.ndarray, detections: sv.Detections) -> bool:
         """
-        Extracts jersey colors from all current detections and runs KMeans
-        to find two team clusters. Call this on an early frame where most
-        players are visible.
-
-        Returns True if calibration succeeded (found 2 clear clusters).
+        Extract jersey colours and cluster into 2 teams.
+        Returns True if calibration succeeded.
         """
-        if len(detections) < 4:
-            return False  # Need enough players to find two clusters reliably
-
-        crops = self._extract_jersey_crops(frame, detections)
-        if len(crops) < 4:
+        if len(detections) < self.MIN_PLAYERS_FOR_CALIBRATION:
             return False
 
-        dominant_colors = np.array([self._dominant_color(crop) for crop in crops])
+        crops = self._extract_crops(frame, detections)
+        colors = np.array([self._dominant_color(c) for c in crops])
 
-        # KMeans with k=2 — find two team jersey colors
-        kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
-        kmeans.fit(dominant_colors)
+        # Need at least 4 valid colours
+        valid = colors[np.any(colors > 0, axis=1)]
+        if len(valid) < self.MIN_PLAYERS_FOR_CALIBRATION:
+            return False
 
-        self.team_a_color = kmeans.cluster_centers_[0]
-        self.team_b_color = kmeans.cluster_centers_[1]
+        # scipy kmeans2 — replaces sklearn
+        centroids, labels = kmeans2(valid.astype(np.float64), 2, minit="++")
+
+        self._team_a_color = centroids[0].astype(np.float32)
+        self._team_b_color = centroids[1].astype(np.float32)
         self._is_calibrated = True
-
         return True
 
+    # ─── Classification ────────────────────────────────────────────────
+
     def classify(
-        self,
-        frame: np.ndarray,
-        detections: sv.Detections
-    ) -> dict:
-        """
-        Assigns each detection to team_a, team_b, or "outlier".
-        Returns a dict mapping detection index -> "team_a" | "team_b" | "outlier"
-        """
+        self, frame: np.ndarray, detections: sv.Detections
+    ) -> Dict[int, str]:
+        """Assign each detection to team_a, team_b, or ref."""
         if not self._is_calibrated or len(detections) == 0:
             return {}
 
-        crops = self._extract_jersey_crops(frame, detections)
-        assignments = {}
+        crops = self._extract_crops(frame, detections)
+        out: Dict[int, str] = {}
 
         for i, crop in enumerate(crops):
             color = self._dominant_color(crop)
-            dist_a = np.linalg.norm(color - self.team_a_color)
-            dist_b = np.linalg.norm(color - self.team_b_color)
+            da = np.linalg.norm(color - self._team_a_color)
+            db = np.linalg.norm(color - self._team_b_color)
+            min_d = min(da, db)
 
-            min_dist = min(dist_a, dist_b)
-            if min_dist > self.OUTLIER_DISTANCE_THRESHOLD:
-                assignments[i] = "outlier"
-            elif dist_a < dist_b:
-                assignments[i] = "team_a"
+            if min_d > self.OUTLIER_DISTANCE:
+                out[i] = "ref"
+            elif da < db:
+                out[i] = "team_a"
             else:
-                assignments[i] = "team_b"
+                out[i] = "team_b"
 
-        return assignments
+        return out
 
     def filter_non_players(
-        self,
-        frame: np.ndarray,
-        detections: sv.Detections
+        self, frame: np.ndarray, detections: sv.Detections
     ) -> sv.Detections:
-        """
-        Removes detections classified as outliers (refs, coaches).
-        Returns filtered detections containing only team_a and team_b players.
-        """
+        """Remove refs/coaches, keep team players only."""
         if not self._is_calibrated or len(detections) == 0:
             return detections
 
         assignments = self.classify(frame, detections)
-        keep = [i for i, label in assignments.items() if label != "outlier"]
+        keep = [i for i, label in assignments.items() if label != "ref"]
 
         if not keep:
-            return detections  # Fallback — don't wipe everything if calibration is off
-
+            return detections  # don't wipe everything
         return detections[np.array(keep)]
 
-    def get_team_label(self, frame: np.ndarray, detections: sv.Detections, index: int) -> str:
-        """
-        Returns the team label for a single detection by index.
-        """
-        assignments = self.classify(frame, detections)
-        return assignments.get(index, "unknown")
+    # ─── Internals ─────────────────────────────────────────────────────
 
-    def _extract_jersey_crops(
-        self,
-        frame: np.ndarray,
-        detections: sv.Detections
+    def _extract_crops(
+        self, frame: np.ndarray, detections: sv.Detections
     ) -> list:
-        """
-        Crops the upper-body region of each detection for jersey color sampling.
-        Skips crops that are too small to be reliable.
-        """
-        crops = []
-        h_frame, w_frame = frame.shape[:2]
+        return [
+            crop_region(frame, detections.xyxy[i], self.JERSEY_CROP_TOP, self.JERSEY_CROP_BOTTOM)
+            for i in range(len(detections))
+        ]
 
-        for i in range(len(detections)):
-            box = detections.xyxy[i]
-            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-
-            box_h = y2 - y1
-            crop_y1 = y1 + int(box_h * self.JERSEY_CROP_TOP)
-            crop_y2 = y1 + int(box_h * self.JERSEY_CROP_BOTTOM)
-
-            # Clamp to frame
-            crop_y1 = max(0, min(crop_y1, h_frame - 1))
-            crop_y2 = max(0, min(crop_y2, h_frame - 1))
-            x1 = max(0, min(x1, w_frame - 1))
-            x2 = max(0, min(x2, w_frame - 1))
-
-            if crop_y2 <= crop_y1 or x2 <= x1:
-                crops.append(np.zeros((1, 1, 3), dtype=np.uint8))
-                continue
-
-            crops.append(frame[crop_y1:crop_y2, x1:x2])
-
-        return crops
-
-    def _dominant_color(self, crop: np.ndarray) -> np.ndarray:
-        """
-        Returns the dominant HSV color of a crop using KMeans with k=1.
-        More robust than a simple mean — ignores background pixels at edges.
-        """
+    @staticmethod
+    def _dominant_color(crop: np.ndarray) -> np.ndarray:
+        """Dominant HSV colour via single-centroid KMeans."""
         if crop.size == 0 or crop.shape[0] < 4 or crop.shape[1] < 4:
-            return np.zeros(3)
+            return np.zeros(3, dtype=np.float32)
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        pixels = hsv.reshape(-1, 3).astype(np.float32)
+        pixels = hsv.reshape(-1, 3).astype(np.float64)
 
-        # Filter near-white (court lines) and near-black (shadows) pixels
-        sat_mask = (pixels[:, 1] > 30) & (pixels[:, 2] > 40)
-        filtered = pixels[sat_mask]
+        # Filter near-white/black
+        mask = (pixels[:, 1] > 30) & (pixels[:, 2] > 40)
+        filtered = pixels[mask]
 
         if len(filtered) < 10:
-            return np.mean(pixels, axis=0)
+            return np.mean(pixels, axis=0).astype(np.float32)
 
-        kmeans = KMeans(n_clusters=1, n_init=3, random_state=0)
-        kmeans.fit(filtered)
-        return kmeans.cluster_centers_[0]
+        centroids, _ = kmeans2(filtered, 1, minit="++")
+        return centroids[0].astype(np.float32)
